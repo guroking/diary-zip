@@ -3,9 +3,10 @@ const router = express.Router();
 const diaryController = require('../controllers/diaryController');
 const authMiddleware = require('../middlewares/authMiddleware');
 
-router.get('/day', calendarController.getDayData);
-router.get('/insight', calendarController.getInsightData);
+// 모든 일기 관련 API는 로그인이 필요하므로 authMiddleware를 거칩니다.
+router.use(authMiddleware.verifyToken);
 
-router.post('/', authMiddleware.verifyToken, diaryController.createDiary);
+// POST /api/diaries (일기 작성 및 AI 분석)
+router.post('/', diaryController.createDiary);
 
 module.exports = router;

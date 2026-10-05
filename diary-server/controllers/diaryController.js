@@ -4,22 +4,18 @@ const db = require('../config/db');
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 exports.createDiary = async (req, res) => {
-    // 트랜잭션 처리를 위해 pool에서 단일 커넥션을 빌려옵니다.
-    const connection = await db.getConnection();
+    const client = await db.getClient();
     
     try {
         const { content, user_emoji, user_score, is_locked = false } = req.body;
-        
-        // authMiddleware를 통과하면서 req.user에 담긴 로그인 유저 정보
         const user_id = req.user.id; 
 
         if (!content || !user_emoji || user_score == null) {
             return res.status(400).json({ error: "일기 내용, 표정, 점수는 필수 항목입니다." });
         }
 
-        // 1. 구글 AI 호출
         const model = genAI.getGenerativeModel({ 
-            model: "gemini-3.5-flash-lite",
+            model: "gemini-2.5-flash", // 최신 안정 버전
             generationConfig: { responseMimeType: "application/json" }
         });
 
@@ -49,31 +45,25 @@ exports.createDiary = async (req, res) => {
         const result = await model.generateContent(prompt);
         const aiData = JSON.parse(result.response.text());
 
-        // 2. DB 트랜잭션 시작 (두 테이블 중 하나라도 실패하면 모두 취소하기 위함)
-        await connection.beginTransaction();
+        await client.query('BEGIN');
 
-        // 2-1. 원본 일기 테이블에 저장
-        // 달력 조회를 위해 오늘 날짜를 YYYY-MM-DD 형태로 변환
         const diaryDate = new Date().toISOString().split('T')[0]; 
         
-        const [diaryResult] = await connection.execute(
-            `INSERT INTO diaries (user_id, diary_date, content, user_emoji, user_score, is_locked)
-             VALUES (?, ?, ?, ?, ?, ?)`,
+        // PostgreSQL은 RETURNING id를 통해 방금 INSERT된 row의 id를 바로 가져올 수 있습니다.
+        const diaryResult = await client.query(
+            'INSERT INTO diaries (user_id, diary_date, content, user_emoji, user_score, is_locked) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
             [user_id, diaryDate, content, user_emoji, user_score, is_locked]
         );
 
-        const newDiaryId = diaryResult.insertId; // 방금 생성된 일기의 PK(ID)
+        const newDiaryId = diaryResult.rows[0].id;
 
-        // 2-2. AI 분석 결과 테이블에 저장
-        await connection.execute(
-            `INSERT INTO diary_ai_summaries 
-             (diary_id, title, one_line_summary, three_line_summary, ai_emoji, ai_score, ai_comment, gratitude, reflection, reminders)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        await client.query(
+            'INSERT INTO diary_ai_summaries (diary_id, title, one_line_summary, three_line_summary, ai_emoji, ai_score, ai_comment, gratitude, reflection, reminders) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
             [
                 newDiaryId,
                 aiData.title,
                 aiData.one_line_summary,
-                JSON.stringify(aiData.three_line_summary), // 배열은 JSON 문자열로 변환하여 저장
+                JSON.stringify(aiData.three_line_summary),
                 aiData.ai_emoji,
                 aiData.ai_score,
                 aiData.ai_comment,
@@ -83,8 +73,7 @@ exports.createDiary = async (req, res) => {
             ]
         );
 
-        // 3. 트랜잭션 확정 (모두 성공)
-        await connection.commit();
+        await client.query('COMMIT');
         
         res.status(201).json({ 
             message: "일기가 성공적으로 분석 및 저장되었습니다.", 
@@ -93,12 +82,10 @@ exports.createDiary = async (req, res) => {
         });
 
     } catch (error) {
-        // 에러 발생 시 트랜잭션 롤백 (DB 변경사항 원상복구)
-        await connection.rollback();
+        await client.query('ROLLBACK');
         console.error("Diary Creation Error:", error);
         res.status(500).json({ error: "일기 분석 및 저장 중 오류가 발생했습니다." });
     } finally {
-        // 커넥션을 다시 pool에 반납 (매우 중요)
-        connection.release();
+        client.release();
     }
 };
