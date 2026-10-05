@@ -27,3 +27,22 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 서버 구동 완료: http://localhost:${PORT}`);
 });
+
+const pool = require('./config/db');
+
+async function initDB() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS diaries (
+                id SERIAL PRIMARY KEY,
+                title VARCHAR(255) NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        console.log('✅ 다이어리 테이블 생성 완료 또는 이미 존재함');
+    } catch (err) {
+        console.error('❌ 테이블 생성 실패:', err);
+    }
+}
+initDB();
