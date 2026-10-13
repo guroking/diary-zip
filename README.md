@@ -170,8 +170,3 @@ cd ../diary-client && npm run dev
 * **단방향 해시 암호화**: 로그인 비밀번호와 2차 PIN은 `bcrypt`를 통해 솔팅(Salting) 후 해시화되어 저장됩니다.
 
 ---
-
-## 📄 라이선스 (License)
-
-Copyright © 2026. All rights reserved.  
-*(오픈소스 배포로 전환할 경우 [MIT License]로 변경할 수 있습니다.)*
