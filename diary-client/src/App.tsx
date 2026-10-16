@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 
 // --- 타입 정의 ---
 interface SummaryData {
@@ -11,19 +11,36 @@ interface SummaryData {
   gratitude: string | null;
   reflection: string | null;
   reminders: string[];
+  source?: 'ai' | 'fallback';
 }
 
-interface CalendarMonthData {
-  diary_date: string;
+interface CalendarEntry {
+  id: number;
+  date_key: string;
   is_locked: boolean;
   ai_emoji: string;
   ai_score: number;
 }
 
+interface DiaryDetail {
+  id: number;
+  date_key: string;
+  time_label: string;
+  content: string;
+  user_emoji: string;
+  user_score: number;
+  is_locked: boolean;
+  ai_emoji: string;
+  ai_score: number;
+  ai_result: SummaryData | null;
+}
+
 interface InsightData {
   averageScore: number;
+  averageUserScore: number;
   topEmoji: string;
   totalDiaries: number;
+  emojiCounts: { emoji: string; count: number }[];
 }
 
 interface UserSettings {
@@ -32,34 +49,132 @@ interface UserSettings {
   require_on_diary?: boolean;
 }
 
-function App() {
-  const [token, setToken] = useState<string | null>(localStorage.getItem('token'));
-  
-  // 설정 데이터 불러오기 (없으면 빈 객체)
-  const [settings, setSettings] = useState<UserSettings>(() => {
-    try { return JSON.parse(localStorage.getItem('settings') || '{}'); } 
-    catch { return {}; }
-  });
+type Tab = 'write' | 'calendar' | 'insight' | 'settings';
+type ThemeMode = 'system' | 'light' | 'dark';
 
-  const [activeTab, setActiveTab] = useState<'home' | 'write' | 'calendar' | 'insight' | 'settings'>('write');
+// --- 상수 & 유틸 ---
+const API_BASE = 'https://diary-server-z721.onrender.com';
+const EMOJI_LIST = ['😆', '😃', '😐', '😢', '😡', '😱'];
+const WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토'];
+const DRAFT_KEY = 'diary_draft';
+const MAX_LENGTH = 5000;
+
+const pad = (n: number) => String(n).padStart(2, '0');
+const toDateKey = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const formatDateKey = (key: string) => {
+  const [y, m, d] = key.split('-').map(Number);
+  const w = WEEKDAYS[new Date(y, m - 1, d).getDay()];
+  return `${y}년 ${m}월 ${d}일 (${w})`;
+};
+const errorMessage = (e: unknown) => (e instanceof Error ? e.message : '알 수 없는 오류가 발생했습니다.');
+const readSettings = (): UserSettings => {
+  try {
+    return JSON.parse(localStorage.getItem('settings') || '{}') || {};
+  } catch {
+    return {};
+  }
+};
+
+// --- 디자인 시스템 (CSS 변수 기반 → 라이트/다크 자동 대응) ---
+const colors = {
+  bg: 'var(--bg)',
+  card: 'var(--card)',
+  primary: 'var(--primary)',
+  primarySoft: 'var(--primary-soft)',
+  primaryDisabled: 'var(--primary-disabled)',
+  textMain: 'var(--text)',
+  textBody: 'var(--text-body)',
+  textSub: 'var(--text-sub)',
+  inputBg: 'var(--input-bg)',
+  border: 'var(--border)',
+  danger: 'var(--danger)',
+};
+const cardStyle: React.CSSProperties = { backgroundColor: colors.card, borderRadius: '24px', padding: '24px', marginBottom: '16px', boxShadow: 'var(--shadow)' };
+const inputStyle: React.CSSProperties = { width: '100%', padding: '16px', borderRadius: '12px', border: `1px solid ${colors.border}`, backgroundColor: colors.inputBg, fontSize: '16px', color: colors.textMain };
+const primaryBtn: React.CSSProperties = { width: '100%', padding: '16px', background: colors.primary, color: '#fff', border: 'none', borderRadius: '12px', fontSize: '16px', fontWeight: 700, cursor: 'pointer' };
+const ghostBtn: React.CSSProperties = { background: 'none', border: 'none', color: colors.textSub, cursor: 'pointer', fontWeight: 600, fontSize: '14px' };
+const overlayStyle: React.CSSProperties = { position: 'fixed', inset: 0, backgroundColor: 'rgba(0, 0, 0, 0.55)', zIndex: 500, display: 'flex', justifyContent: 'center', alignItems: 'flex-end' };
+const sheetStyle: React.CSSProperties = { width: '100%', maxWidth: '480px', maxHeight: '88vh', overflowY: 'auto', backgroundColor: colors.card, color: colors.textMain, borderRadius: '24px 24px 0 0', padding: '24px 24px 40px' };
+
+// --- AI 분석 결과 카드 (작성 직후 & 상세 화면 공용) ---
+function AnalysisCard({ data }: { data: SummaryData }) {
+  const lines = Array.isArray(data.three_line_summary) ? data.three_line_summary : [];
+  const reminders = Array.isArray(data.reminders) ? data.reminders : [];
+  return (
+    <div>
+      <h3 style={{ margin: '0 0 8px 0', color: colors.primary }}>{data.title}</h3>
+      <p style={{ margin: '0 0 20px 0', fontSize: '17px', fontWeight: 600 }}>{data.one_line_summary}</p>
+      <div style={{ backgroundColor: colors.primarySoft, padding: '16px', borderRadius: '16px', marginBottom: '20px' }}>
+        <p style={{ margin: '0 0 8px 0', fontWeight: 700 }}>🤖 AI 코멘트 {data.ai_emoji} (AI 평가: {data.ai_score}점)</p>
+        <p style={{ margin: 0, lineHeight: 1.6, color: colors.textBody }}>{data.ai_comment}</p>
+      </div>
+      {lines.length > 0 && (
+        <>
+          <h4 style={{ margin: '0 0 12px 0' }}>📝 핵심 3줄 요약</h4>
+          <ol style={{ margin: 0, paddingLeft: '20px', color: colors.textBody, lineHeight: 1.7 }}>
+            {lines.map((line, idx) => <li key={idx}>{line}</li>)}
+          </ol>
+        </>
+      )}
+      {(data.gratitude || data.reflection || reminders.length > 0) && (
+        <div style={{ marginTop: '20px', display: 'grid', gap: '10px' }}>
+          {data.gratitude && (
+            <div style={{ backgroundColor: colors.inputBg, borderRadius: '12px', padding: '12px 16px' }}>
+              <strong>🙏 감사한 일</strong>
+              <p style={{ margin: '4px 0 0', color: colors.textBody }}>{data.gratitude}</p>
+            </div>
+          )}
+          {data.reflection && (
+            <div style={{ backgroundColor: colors.inputBg, borderRadius: '12px', padding: '12px 16px' }}>
+              <strong>🪞 돌아볼 점</strong>
+              <p style={{ margin: '4px 0 0', color: colors.textBody }}>{data.reflection}</p>
+            </div>
+          )}
+          {reminders.length > 0 && (
+            <div style={{ backgroundColor: colors.inputBg, borderRadius: '12px', padding: '12px 16px' }}>
+              <strong>⏰ 잊지 말 것</strong>
+              <ul style={{ margin: '4px 0 0', paddingLeft: '20px', color: colors.textBody, lineHeight: 1.6 }}>
+                {reminders.map((r, idx) => <li key={idx}>{r}</li>)}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+      {data.source === 'fallback' && (
+        <p style={{ margin: '16px 0 0', fontSize: '12px', color: colors.textSub }}>※ AI 분석 서버에 연결하지 못해 일기 내용을 바탕으로 간단히 요약했어요.</p>
+      )}
+    </div>
+  );
+}
+
+function App() {
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem('token'));
+  const [settings, setSettings] = useState<UserSettings>(readSettings);
+  const [activeTab, setActiveTab] = useState<Tab>('write');
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    const t = localStorage.getItem('theme');
+    return t === 'light' || t === 'dark' ? t : 'system';
+  });
 
   // 인증 상태
   const [isLoginMode, setIsLoginMode] = useState(true);
   const [loginId, setLoginId] = useState('');
   const [password, setPassword] = useState('');
   const [authMessage, setAuthMessage] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
 
   // 2차 보안 잠금 상태
   const [isAppUnlocked, setIsAppUnlocked] = useState(() => {
-    const storedSettings = JSON.parse(localStorage.getItem('settings') || '{}');
-    return !(storedSettings.require_on_login && storedSettings.secondary_password);
+    const s = readSettings();
+    return !(s.require_on_login && s.secondary_password);
   });
-  const [showDiaryLock, setShowDiaryLock] = useState(false);
+  const [pendingDiaryId, setPendingDiaryId] = useState<number | null>(null);
   const [lockInput, setLockInput] = useState('');
   const [lockError, setLockError] = useState('');
+  const [lockLoading, setLockLoading] = useState(false);
 
-  // 일기 작성 상태
-  const [content, setContent] = useState('');
+  // 일기 작성 상태 (임시저장 복원)
+  const [content, setContent] = useState(() => localStorage.getItem(DRAFT_KEY) || '');
   const [userEmoji, setUserEmoji] = useState('😐');
   const [userScore, setUserScore] = useState<number>(50);
   const [isLocked, setIsLocked] = useState(false);
@@ -67,218 +182,369 @@ function App() {
   const [result, setResult] = useState<SummaryData | null>(null);
 
   // 달력 및 통계 상태
-  const [monthData, setMonthData] = useState<CalendarMonthData[]>([]);
+  const [viewYear, setViewYear] = useState(() => new Date().getFullYear());
+  const [viewMonth, setViewMonth] = useState(() => new Date().getMonth() + 1);
+  const [monthData, setMonthData] = useState<CalendarEntry[]>([]);
+  const [calendarLoading, setCalendarLoading] = useState(false);
   const [insightData, setInsightData] = useState<InsightData | null>(null);
+  const [insightLoading, setInsightLoading] = useState(false);
 
-  const EMOJI_LIST = ['😆', '😃', '😐', '😢', '😡', '😱'];
-  const API_BASE = 'https://diary-server-z721.onrender.com';
+  // 일기 상세 상태
+  const [detail, setDetail] = useState<DiaryDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [dayEntries, setDayEntries] = useState<CalendarEntry[] | null>(null);
 
-  // --- API 호출 함수 ---
+  const todayKey = toDateKey(new Date());
+
+  // 테마 적용
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'system') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', theme);
+    localStorage.setItem('theme', theme);
+  }, [theme]);
+
+  // 작성 중인 일기 자동 임시저장 (디바운스)
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (content) localStorage.setItem(DRAFT_KEY, content);
+      else localStorage.removeItem(DRAFT_KEY);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [content]);
+
+  // --- API 호출 ---
+  const authFetch = useCallback(async (path: string, init: RequestInit = {}) => {
+    const res = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || data.message || '요청 처리 중 오류가 발생했습니다.');
+    return data;
+  }, [token]);
+
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const endpoint = isLoginMode ? '/api/auth/login' : '/api/auth/register';
+    setAuthLoading(true);
     try {
       const res = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ login_id: loginId, password })
+        body: JSON.stringify({ login_id: loginId, password }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '요청에 실패했습니다.');
 
       if (isLoginMode) {
+        const nextSettings: UserSettings = data.settings || {};
         localStorage.setItem('token', data.token);
-        localStorage.setItem('settings', JSON.stringify(data.settings));
+        localStorage.setItem('settings', JSON.stringify(nextSettings));
         setToken(data.token);
-        setSettings(data.settings);
+        setSettings(nextSettings);
         setAuthMessage('');
-        
-        // 로그인 시 2차 비밀번호를 묻도록 설정되어 있다면 앱을 잠금 상태로 전환
-        if (data.settings.require_on_login && data.settings.secondary_password) {
-          setIsAppUnlocked(false);
-        } else {
-          setIsAppUnlocked(true);
-        }
+        setIsAppUnlocked(!(nextSettings.require_on_login && nextSettings.secondary_password));
       } else {
         setAuthMessage('회원가입 완료! 로그인해주세요.');
         setIsLoginMode(true);
         setLoginId('');
         setPassword('');
       }
-    } catch (err: any) {
-      setAuthMessage(err.message);
+    } catch (err) {
+      setAuthMessage(errorMessage(err));
+    } finally {
+      setAuthLoading(false);
     }
   };
 
   const handleLogout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('settings');
+    localStorage.removeItem(DRAFT_KEY);
     setToken(null);
     setSettings({});
     setActiveTab('write');
     setResult(null);
+    setContent('');
+    setDetail(null);
+    setDayEntries(null);
+    setPendingDiaryId(null);
+    setIsAppUnlocked(true);
   };
 
-  // 2차 비밀번호 저장
   const handleSaveSettings = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/settings`, {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}` 
-        },
-        body: JSON.stringify(settings)
-      });
-      if (!res.ok) throw new Error('설정 저장 실패');
-      
+      await authFetch('/api/settings', { method: 'POST', body: JSON.stringify(settings) });
       localStorage.setItem('settings', JSON.stringify(settings));
       alert('보안 설정이 성공적으로 저장되었습니다!');
     } catch (err) {
-      alert('설정 저장 중 오류가 발생했습니다.');
+      alert(`설정 저장 중 오류가 발생했습니다.\n${errorMessage(err)}`);
     }
   };
 
-  // 2차 비밀번호 검증 (앱 켤 때 or 일기 볼 때)
-  const handleUnlock = () => {
-    if (lockInput === settings.secondary_password) {
-      if (!isAppUnlocked) {
-        setIsAppUnlocked(true);
-      }
-      if (showDiaryLock) {
-        setShowDiaryLock(false);
-        alert('잠금이 해제되었습니다! (일기 상세 보기 화면이 연결될 예정입니다.)');
-      }
-      setLockInput('');
-      setLockError('');
-    } else {
-      setLockError('비밀번호가 일치하지 않습니다.');
+  // 일기 상세 열기
+  const openDiary = async (id: number) => {
+    setDayEntries(null);
+    setDetail(null);
+    setDetailLoading(true);
+    try {
+      const data = await authFetch(`/api/diaries/${id}`);
+      setDetail(data.data);
+    } catch (err) {
+      alert(errorMessage(err));
+    } finally {
+      setDetailLoading(false);
     }
   };
 
-  // 달력에서 개별 일기 클릭 시
-  const handleDiaryClick = (day: CalendarMonthData) => {
-    if (day.is_locked && settings.require_on_diary && settings.secondary_password) {
+  // 비밀 일기면 2차 비밀번호 확인 후 열기
+  const requestOpenDiary = (entry: CalendarEntry) => {
+    if (entry.is_locked && settings.require_on_diary && settings.secondary_password) {
+      setDayEntries(null);
       setLockInput('');
       setLockError('');
-      setShowDiaryLock(true);
+      setPendingDiaryId(entry.id);
     } else {
-      alert(`선택한 날짜: ${new Date(day.diary_date).toLocaleDateString()}\nAI 점수: ${day.ai_score}점\n(추후 일기 상세 화면 연결)`);
+      openDiary(entry.id);
+    }
+  };
+
+  const handleDayClick = (entries: CalendarEntry[]) => {
+    if (entries.length === 0) return;
+    if (entries.length === 1) requestOpenDiary(entries[0]);
+    else setDayEntries(entries);
+  };
+
+  // 2차 비밀번호 검증 (서버에서 검증 + 연속 실패 차단)
+  const handleUnlock = async () => {
+    if (!lockInput || lockLoading) return;
+    setLockLoading(true);
+    try {
+      await authFetch('/api/auth/verify-lock', { method: 'POST', body: JSON.stringify({ secondary_password: lockInput }) });
+      setLockInput('');
+      setLockError('');
+      if (!isAppUnlocked) setIsAppUnlocked(true);
+      if (pendingDiaryId !== null) {
+        const id = pendingDiaryId;
+        setPendingDiaryId(null);
+        await openDiary(id);
+      }
+    } catch (err) {
+      setLockError(errorMessage(err));
+    } finally {
+      setLockLoading(false);
+    }
+  };
+
+  const handleDeleteDiary = async (id: number) => {
+    if (!window.confirm('이 일기를 삭제할까요? 삭제하면 되돌릴 수 없어요.')) return;
+    try {
+      await authFetch(`/api/diaries/${id}`, { method: 'DELETE' });
+      setDetail(null);
+      setMonthData(prev => prev.filter(d => d.id !== id));
+    } catch (err) {
+      alert(errorMessage(err));
     }
   };
 
   const handleDiarySubmit = async () => {
-    if (!content.trim()) return;
+    if (!content.trim() || isLoading) return;
     setIsLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/api/diaries`, {
+      const resData = await authFetch('/api/diaries', {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}` 
-        },
-        body: JSON.stringify({ content, user_emoji: userEmoji, user_score: userScore, is_locked: isLocked })
+        body: JSON.stringify({ content, user_emoji: userEmoji, user_score: userScore, is_locked: isLocked }),
       });
-      const resData = await response.json();
-      if (!response.ok) throw new Error(resData.error);
       setResult(resData.ai_result);
       setContent('');
-    } catch (err: any) {
-      alert(err.message);
+      localStorage.removeItem(DRAFT_KEY);
+    } catch (err) {
+      alert(errorMessage(err));
     } finally {
       setIsLoading(false);
     }
   };
 
-  // 달력 및 인사이트 데이터 불러오기
-  useEffect(() => {
-    if ((activeTab === 'calendar' || activeTab === 'insight') && token) {
-      const fetchData = async () => {
-        const year = new Date().getFullYear();
-        const month = new Date().getMonth() + 1;
-        try {
-          const headers = { 'Authorization': `Bearer ${token}` };
-          
-          if (activeTab === 'calendar') {
-            const res = await fetch(`${API_BASE}/api/calendar/month?year=${year}&month=${month}`, { headers });
-            const data = await res.json();
-            if (res.ok) setMonthData(data.data);
-          } else {
-            const res = await fetch(`${API_BASE}/api/calendar/insight?year=${year}&month=${month}`, { headers });
-            const data = await res.json();
-            if (res.ok) setInsightData(data.data);
-          }
-        } catch (e) {
-          console.error(e);
-        }
-      };
-      fetchData();
-    }
-  }, [activeTab, token]);
+  const changeMonth = (delta: number) => {
+    const d = new Date(viewYear, viewMonth - 1 + delta, 1);
+    setViewYear(d.getFullYear());
+    setViewMonth(d.getMonth() + 1);
+  };
 
-  // --- 디자인 시스템 ---
-  const colors = { bg: '#f2f4f6', white: '#ffffff', primary: '#3182f6', textMain: '#191f28', textSub: '#8b95a1', inputBg: '#f9fafb' };
-  const cardStyle: React.CSSProperties = { backgroundColor: colors.white, borderRadius: '24px', padding: '24px', marginBottom: '16px', boxShadow: '0 2px 10px rgba(0,0,0,0.02)' };
+  const goToday = () => {
+    const d = new Date();
+    setViewYear(d.getFullYear());
+    setViewMonth(d.getMonth() + 1);
+  };
+
+  // 달력 데이터
+  useEffect(() => {
+    if (!token || activeTab !== 'calendar') return;
+    let cancelled = false;
+    setCalendarLoading(true);
+    authFetch(`/api/calendar/month?year=${viewYear}&month=${viewMonth}`)
+      .then(d => { if (!cancelled) setMonthData(d.data || []); })
+      .catch(e => { if (!cancelled) { console.error(e); setMonthData([]); } })
+      .finally(() => { if (!cancelled) setCalendarLoading(false); });
+    return () => { cancelled = true; };
+  }, [activeTab, token, viewYear, viewMonth, authFetch]);
+
+  // 통계 데이터
+  useEffect(() => {
+    if (!token || activeTab !== 'insight') return;
+    let cancelled = false;
+    setInsightLoading(true);
+    authFetch(`/api/calendar/insight?year=${viewYear}&month=${viewMonth}`)
+      .then(d => { if (!cancelled) setInsightData(d.data || null); })
+      .catch(e => { if (!cancelled) { console.error(e); setInsightData(null); } })
+      .finally(() => { if (!cancelled) setInsightLoading(false); });
+    return () => { cancelled = true; };
+  }, [activeTab, token, viewYear, viewMonth, authFetch]);
+
+  // 월간 달력 그리드
+  const calendarCells = useMemo(() => {
+    const firstDay = new Date(viewYear, viewMonth - 1, 1).getDay();
+    const daysInMonth = new Date(viewYear, viewMonth, 0).getDate();
+    const byDate: Record<string, CalendarEntry[]> = {};
+    monthData.forEach(entry => {
+      if (!byDate[entry.date_key]) byDate[entry.date_key] = [];
+      byDate[entry.date_key].push(entry);
+    });
+    const cells: ({ day: number; key: string; entries: CalendarEntry[] } | null)[] = [];
+    for (let i = 0; i < firstDay; i++) cells.push(null);
+    for (let d = 1; d <= daysInMonth; d++) {
+      const key = `${viewYear}-${pad(viewMonth)}-${pad(d)}`;
+      cells.push({ day: d, key, entries: byDate[key] || [] });
+    }
+    return cells;
+  }, [viewYear, viewMonth, monthData]);
+
+  const renderMonthNav = () => (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px' }}>
+      <button type="button" onClick={() => changeMonth(-1)} style={{ ...ghostBtn, fontSize: '20px', padding: '4px 12px' }} aria-label="이전 달">‹</button>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <strong style={{ fontSize: '18px' }}>{viewYear}년 {viewMonth}월</strong>
+        <button type="button" onClick={goToday} style={{ ...ghostBtn, fontSize: '12px', border: `1px solid ${colors.border}`, borderRadius: '999px', padding: '4px 10px' }}>오늘</button>
+      </div>
+      <button type="button" onClick={() => changeMonth(1)} style={{ ...ghostBtn, fontSize: '20px', padding: '4px 12px' }} aria-label="다음 달">›</button>
+    </div>
+  );
+
+  const showLockModal = !isAppUnlocked || pendingDiaryId !== null;
+  const maxEmojiCount = insightData && insightData.emojiCounts && insightData.emojiCounts.length > 0 ? insightData.emojiCounts[0].count : 1;
 
   return (
-    <div style={{ backgroundColor: colors.bg, minHeight: '100vh', display: 'flex', justifyContent: 'center', fontFamily: '-apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", Pretendard, sans-serif', color: colors.textMain }}>
+    <div style={{ backgroundColor: colors.bg, minHeight: '100vh', display: 'flex', justifyContent: 'center', color: colors.textMain }}>
       <style>{`
-        @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
-        * { box-sizing: border-box; } body { margin: 0; }
-        input[type=range] { -webkit-appearance: none; width: 100%; background: transparent; }
-        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 24px; width: 24px; border-radius: 50%; background: #ffffff; box-shadow: 0 2px 6px rgba(0,0,0,0.15); cursor: pointer; margin-top: -8px; }
-        input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 8px; cursor: pointer; background: #e5e8eb; border-radius: 4px; }
-        input:focus, textarea:focus { outline: none; border-color: ${colors.primary}; }
+        input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; background: transparent; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 24px; width: 24px; border-radius: 50%; background: #ffffff; box-shadow: 0 2px 6px rgba(0,0,0,0.25); cursor: pointer; margin-top: -8px; }
+        input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 8px; cursor: pointer; background: var(--border); border-radius: 4px; }
+        input:focus, textarea:focus { outline: none; border-color: var(--primary); }
+        textarea::placeholder, input::placeholder { color: var(--text-sub); }
         .emoji-btn { transition: transform 0.2s ease; } .emoji-btn:active { transform: scale(0.9); }
       `}</style>
 
-      <div style={{ width: '100%', maxWidth: '480px', position: 'relative', paddingBottom: '90px' }}>
-        
+      <div style={{ width: '100%', maxWidth: '480px', position: 'relative', paddingBottom: '100px' }}>
+
         {/* === 로그인 화면 === */}
         {!token ? (
-          <div style={{ padding: '40px 24px', display: 'flex', flexDirection: 'column', height: '100vh', justifyContent: 'center' }}>
-            <h1 style={{ fontSize: '28px', fontWeight: 800, marginBottom: '8px' }}>반가워요! <br/> Diary.zip 입니다.</h1>
-            <p style={{ color: colors.textSub, marginBottom: '40px' }}>나만의 AI 다이어리를 시작해보세요.</p>
+          <div style={{ padding: '40px 24px', display: 'flex', flexDirection: 'column', minHeight: '100vh', justifyContent: 'center' }}>
+            <h1 style={{ fontSize: '28px', fontWeight: 800, margin: '0 0 8px 0', color: colors.textMain }}>반가워요! <br /> Diary.zip 입니다.</h1>
+            <p style={{ color: colors.textSub, margin: '0 0 40px 0' }}>나만의 AI 다이어리를 시작해보세요.</p>
             <form onSubmit={handleAuthSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              <input type="text" placeholder="아이디를 입력해주세요" value={loginId} onChange={e => setLoginId(e.target.value)} required style={{ padding: '18px 20px', borderRadius: '16px', border: '1px solid #e5e8eb', backgroundColor: colors.inputBg, fontSize: '16px', color: '#191f28' }} />
-              <input type="password" placeholder="비밀번호를 입력해주세요" value={password} onChange={e => setPassword(e.target.value)} required style={{ padding: '18px 20px', borderRadius: '16px', border: '1px solid #e5e8eb', backgroundColor: colors.inputBg, fontSize: '16px', color: '#191f28' }} />
-              <button type="submit" style={{ padding: '18px', background: colors.primary, color: '#fff', border: 'none', borderRadius: '16px', fontSize: '16px', fontWeight: 700, marginTop: '8px', cursor: 'pointer' }}>
-                {isLoginMode ? '시작하기' : '가입하기'}
+              <input type="text" autoComplete="username" placeholder="아이디를 입력해주세요" value={loginId} onChange={e => setLoginId(e.target.value)} required style={{ ...inputStyle, padding: '18px 20px', borderRadius: '16px' }} />
+              <input type="password" autoComplete={isLoginMode ? 'current-password' : 'new-password'} placeholder="비밀번호를 입력해주세요" value={password} onChange={e => setPassword(e.target.value)} required style={{ ...inputStyle, padding: '18px 20px', borderRadius: '16px' }} />
+              <button type="submit" disabled={authLoading} style={{ ...primaryBtn, padding: '18px', borderRadius: '16px', marginTop: '8px', background: authLoading ? colors.primaryDisabled : colors.primary }}>
+                {authLoading ? '잠시만요... (서버가 깨어나는 중일 수 있어요)' : isLoginMode ? '시작하기' : '가입하기'}
               </button>
             </form>
-            <p style={{ color: '#f04452', textAlign: 'center', marginTop: '16px', fontWeight: 500 }}>{authMessage}</p>
-            <button onClick={() => { setIsLoginMode(!isLoginMode); setAuthMessage(''); setLoginId(''); setPassword(''); }} style={{ background: 'none', border: 'none', color: colors.textSub, cursor: 'pointer', marginTop: '20px', fontSize: '15px' }}>
+            <p style={{ color: colors.danger, textAlign: 'center', marginTop: '16px', fontWeight: 500 }}>{authMessage}</p>
+            <button type="button" onClick={() => { setIsLoginMode(!isLoginMode); setAuthMessage(''); setLoginId(''); setPassword(''); }} style={{ ...ghostBtn, marginTop: '20px', fontSize: '15px', fontWeight: 500 }}>
               {isLoginMode ? '계정이 없으신가요? 간편 가입하기' : '이미 계정이 있으신가요? 로그인'}
             </button>
           </div>
         ) : (
 
-        /* === 메인 앱 화면 === */
+          /* === 메인 앱 화면 === */
           <>
-            {/* 2차 비밀번호 모달 (앱 잠금 or 일기 잠금 시) */}
-            {(!isAppUnlocked || showDiaryLock) && (
-              <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(25, 31, 40, 0.95)', zIndex: 999, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', padding: '24px' }}>
-                <div style={{ width: '100%', maxWidth: '400px', backgroundColor: colors.white, borderRadius: '24px', padding: '32px 24px', textAlign: 'center' }}>
+            {/* 2차 비밀번호 모달 */}
+            {showLockModal && (
+              <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(16, 19, 24, 0.95)', zIndex: 999, display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', padding: '24px' }}>
+                <div style={{ width: '100%', maxWidth: '400px', backgroundColor: colors.card, color: colors.textMain, borderRadius: '24px', padding: '32px 24px', textAlign: 'center' }}>
                   <h2 style={{ margin: '0 0 8px 0', fontSize: '22px' }}>🔒 잠금 해제</h2>
                   <p style={{ color: colors.textSub, margin: '0 0 24px 0' }}>
                     {!isAppUnlocked ? '앱을 사용하려면 2차 비밀번호를 입력하세요.' : '비밀 일기를 보려면 2차 비밀번호를 입력하세요.'}
                   </p>
-                  <input type="password" value={lockInput} onChange={(e) => setLockInput(e.target.value)} placeholder="비밀번호 입력" style={{ width: '100%', padding: '16px', borderRadius: '12px', border: '1px solid #e5e8eb', backgroundColor: colors.inputBg, fontSize: '18px', textAlign: 'center', marginBottom: '16px', color: '#191f28' }} />
-                  {lockError && <p style={{ color: '#f04452', margin: '0 0 16px 0', fontSize: '14px', fontWeight: 600 }}>{lockError}</p>}
+                  <input type="password" autoFocus value={lockInput} onChange={e => setLockInput(e.target.value)} onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === 'Enter') handleUnlock(); }} placeholder="비밀번호 입력" style={{ ...inputStyle, fontSize: '18px', textAlign: 'center', marginBottom: '16px' }} />
+                  {lockError && <p style={{ color: colors.danger, margin: '0 0 16px 0', fontSize: '14px', fontWeight: 600 }}>{lockError}</p>}
                   <div style={{ display: 'flex', gap: '12px' }}>
-                    {showDiaryLock && (
-                      <button onClick={() => { setShowDiaryLock(false); setLockInput(''); setLockError(''); }} style={{ flex: 1, padding: '16px', backgroundColor: '#e5e8eb', color: colors.textSub, border: 'none', borderRadius: '12px', fontSize: '16px', fontWeight: 700, cursor: 'pointer' }}>취소</button>
+                    {isAppUnlocked && pendingDiaryId !== null && (
+                      <button type="button" onClick={() => { setPendingDiaryId(null); setLockInput(''); setLockError(''); }} style={{ ...primaryBtn, flex: 1, background: colors.inputBg, color: colors.textSub }}>취소</button>
                     )}
-                    <button onClick={handleUnlock} style={{ flex: 1, padding: '16px', backgroundColor: colors.primary, color: 'white', border: 'none', borderRadius: '12px', fontSize: '16px', fontWeight: 700, cursor: 'pointer' }}>확인</button>
+                    <button type="button" onClick={handleUnlock} disabled={lockLoading} style={{ ...primaryBtn, flex: 1, background: lockLoading ? colors.primaryDisabled : colors.primary }}>{lockLoading ? '확인 중...' : '확인'}</button>
                   </div>
+                </div>
+              </div>
+            )}
+
+            {/* 같은 날 여러 일기 선택 시트 */}
+            {dayEntries && (
+              <div style={overlayStyle} onClick={() => setDayEntries(null)}>
+                <div style={sheetStyle} onClick={e => e.stopPropagation()}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                    <strong style={{ fontSize: '18px' }}>{formatDateKey(dayEntries[0].date_key)}</strong>
+                    <button type="button" onClick={() => setDayEntries(null)} style={ghostBtn}>닫기</button>
+                  </div>
+                  <div style={{ display: 'grid', gap: '10px' }}>
+                    {dayEntries.map((entry, idx) => (
+                      <button key={entry.id} type="button" onClick={() => requestOpenDiary(entry)} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '14px 16px', borderRadius: '14px', border: `1px solid ${colors.border}`, background: colors.inputBg, color: colors.textMain, cursor: 'pointer', fontSize: '15px', textAlign: 'left' }}>
+                        <span style={{ fontSize: '24px' }}>{entry.is_locked ? '🔒' : entry.ai_emoji}</span>
+                        <span style={{ flex: 1, fontWeight: 600 }}>{dayEntries.length - idx}번째 기록</span>
+                        {!entry.is_locked && <span style={{ color: colors.primary, fontWeight: 700 }}>{entry.ai_score}점</span>}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* 일기 상세 시트 */}
+            {(detail || detailLoading) && (
+              <div style={overlayStyle} onClick={() => { if (!detailLoading) setDetail(null); }}>
+                <div style={sheetStyle} onClick={e => e.stopPropagation()}>
+                  {detailLoading || !detail ? (
+                    <p style={{ textAlign: 'center', color: colors.textSub, padding: '40px 0' }}>일기를 불러오는 중이에요...</p>
+                  ) : (
+                    <>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
+                        <div>
+                          <div style={{ fontSize: '18px', fontWeight: 800 }}>{formatDateKey(detail.date_key)}</div>
+                          <div style={{ fontSize: '13px', color: colors.textSub, marginTop: '4px' }}>
+                            {detail.time_label} 작성 · 내 기분 {detail.user_emoji} {detail.user_score}점{detail.is_locked ? ' · 🔒 비밀 일기' : ''}
+                          </div>
+                        </div>
+                        <button type="button" onClick={() => setDetail(null)} style={ghostBtn}>닫기</button>
+                      </div>
+                      <div style={{ backgroundColor: colors.inputBg, borderRadius: '16px', padding: '18px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.7, marginBottom: '20px', color: colors.textBody }}>
+                        {detail.content}
+                      </div>
+                      {detail.ai_result ? (
+                        <AnalysisCard data={detail.ai_result} />
+                      ) : (
+                        <p style={{ color: colors.textSub, fontSize: '14px' }}>이 일기는 AI 요약 저장 기능 이전에 작성되어 요약이 없어요. (AI 평가 {detail.ai_emoji} {detail.ai_score}점)</p>
+                      )}
+                      <button type="button" onClick={() => handleDeleteDiary(detail.id)} style={{ ...primaryBtn, marginTop: '24px', background: 'transparent', color: colors.danger, border: `1px solid ${colors.border}` }}>이 일기 삭제하기</button>
+                    </>
+                  )}
                 </div>
               </div>
             )}
 
             {/* 헤더 */}
             <div style={{ padding: '24px 24px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', position: 'sticky', top: 0, backgroundColor: colors.bg, zIndex: 10 }}>
-              <h2 style={{ margin: 0, fontSize: '22px', fontWeight: 800 }}>Diary.zip 🗂</h2>
-              <button onClick={handleLogout} style={{ background: 'none', border: 'none', color: colors.textSub, fontSize: '14px', cursor: 'pointer', fontWeight: 600 }}>로그아웃</button>
+              <h2 style={{ margin: 0, fontSize: '22px', fontWeight: 800, color: colors.textMain }}>Diary.zip 🗂</h2>
+              <button type="button" onClick={handleLogout} style={ghostBtn}>로그아웃</button>
             </div>
 
             <div style={{ padding: '0 24px' }}>
@@ -289,7 +555,7 @@ function App() {
                     <p style={{ margin: '0 0 16px 0', fontWeight: 700, fontSize: '18px' }}>오늘의 기분은 어땠나요?</p>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '2rem' }}>
                       {EMOJI_LIST.map(emoji => (
-                        <span key={emoji} className="emoji-btn" onClick={() => setUserEmoji(emoji)} style={{ cursor: 'pointer', opacity: userEmoji === emoji ? 1 : 0.2, filter: userEmoji === emoji ? 'none' : 'grayscale(100%)' }}>{emoji}</span>
+                        <span key={emoji} role="button" aria-label={`기분 ${emoji}`} className="emoji-btn" onClick={() => setUserEmoji(emoji)} style={{ cursor: 'pointer', opacity: userEmoji === emoji ? 1 : 0.25, filter: userEmoji === emoji ? 'none' : 'grayscale(100%)' }}>{emoji}</span>
                       ))}
                     </div>
                   </div>
@@ -297,32 +563,27 @@ function App() {
                     <p style={{ margin: '0 0 20px 0', fontWeight: 700, fontSize: '18px', display: 'flex', justifyContent: 'space-between' }}>
                       <span>오늘 하루 점수</span><span style={{ color: colors.primary }}>{userScore}점</span>
                     </p>
-                    <input type="range" min="1" max="100" value={userScore} onChange={(e) => setUserScore(Number(e.target.value))} />
+                    <input type="range" min="1" max="100" value={userScore} onChange={e => setUserScore(Number(e.target.value))} />
                   </div>
                   <div style={{ ...cardStyle, padding: '16px 24px' }}>
                     <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', fontWeight: 600 }}>
-                      <input type="checkbox" checked={isLocked} onChange={(e) => setIsLocked(e.target.checked)} style={{ width: '20px', height: '20px', marginRight: '12px', accentColor: colors.primary }} />
+                      <input type="checkbox" checked={isLocked} onChange={e => setIsLocked(e.target.checked)} style={{ width: '20px', height: '20px', marginRight: '12px', accentColor: 'var(--primary)' }} />
                       {isLocked ? '🔒 나만 보는 비밀 일기로 저장할게요' : '🔓 달력에 기분이 공개돼요'}
                     </label>
                   </div>
                   <div style={{ ...cardStyle, padding: 0, overflow: 'hidden' }}>
-                    <textarea value={content} onChange={(e) => setContent(e.target.value)} placeholder="오늘 하루 있었던 일을 편하게 적어주세요." style={{ width: '100%', height: '200px', padding: '24px', border: 'none', fontSize: '16px', lineHeight: 1.6, resize: 'none' }} disabled={isLoading} />
+                    <textarea value={content} maxLength={MAX_LENGTH} onChange={e => setContent(e.target.value)} placeholder="오늘 하루 있었던 일을 편하게 적어주세요." style={{ width: '100%', height: '220px', padding: '24px', border: 'none', fontSize: '16px', lineHeight: 1.6, resize: 'none', backgroundColor: colors.card, color: colors.textMain, display: 'block' }} disabled={isLoading} />
+                    <div style={{ display: 'flex', justifyContent: 'space-between', padding: '0 24px 14px', fontSize: '12px', color: colors.textSub }}>
+                      <span>{content ? '💾 자동 임시저장 중' : ''}</span>
+                      <span>{content.length} / {MAX_LENGTH}자</span>
+                    </div>
                   </div>
-                  <button onClick={handleDiarySubmit} disabled={isLoading || !content.trim()} style={{ width: '100%', padding: '18px', background: isLoading ? '#a9cbf9' : colors.primary, color: 'white', border: 'none', borderRadius: '16px', fontSize: '16px', fontWeight: 700, cursor: 'pointer', boxShadow: '0 4px 14px rgba(49, 130, 246, 0.3)' }}>
+                  <button type="button" onClick={handleDiarySubmit} disabled={isLoading || !content.trim()} style={{ ...primaryBtn, padding: '18px', borderRadius: '16px', background: isLoading || !content.trim() ? colors.primaryDisabled : colors.primary, boxShadow: '0 4px 14px rgba(49, 130, 246, 0.3)' }}>
                     {isLoading ? 'AI가 다이어리를 분석하고 있어요...' : '일기 저장하고 AI 분석 받기'}
                   </button>
                   {result && (
-                    <div style={{ ...cardStyle, marginTop: '24px', border: `2px solid ${colors.primary}`, backgroundColor: '#f9fbff' }}>
-                      <h3 style={{ margin: '0 0 8px 0', color: colors.primary }}>{result.title}</h3>
-                      <p style={{ margin: '0 0 20px 0', fontSize: '17px', fontWeight: 600 }}>{result.one_line_summary}</p>
-                      <div style={{ backgroundColor: '#eaf2ff', padding: '16px', borderRadius: '16px', marginBottom: '20px' }}>
-                        <p style={{ margin: '0 0 8px 0', fontWeight: 700 }}>🤖 AI 코멘트 {result.ai_emoji} (AI 평가: {result.ai_score}점)</p>
-                        <p style={{ margin: 0, lineHeight: 1.5, color: '#333d4b' }}>{result.ai_comment}</p>
-                      </div>
-                      <h4 style={{ margin: '0 0 12px 0' }}>📝 핵심 3줄 요약</h4>
-                      <ul style={{ margin: 0, paddingLeft: '20px', color: '#4e5968', lineHeight: 1.6 }}>
-                        {result.three_line_summary.map((line, idx) => <li key={idx}>{line}</li>)}
-                      </ul>
+                    <div style={{ ...cardStyle, marginTop: '24px', border: `2px solid ${colors.primary}` }}>
+                      <AnalysisCard data={result} />
                     </div>
                   )}
                 </div>
@@ -331,17 +592,40 @@ function App() {
               {/* 탭: 달력 */}
               {activeTab === 'calendar' && (
                 <div style={cardStyle}>
-                  <h3 style={{ margin: '0 0 20px 0', fontSize: '20px' }}>이번 달 감정 모아보기 📅</h3>
-                  {monthData.length === 0 ? <p style={{ color: colors.textSub, textAlign: 'center', padding: '40px 0' }}>작성된 일기가 없어요.</p> : (
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '12px' }}>
-                      {monthData.map((day, idx) => (
-                        <div key={idx} onClick={() => handleDiaryClick(day)} style={{ padding: '12px 0', textAlign: 'center', backgroundColor: colors.bg, borderRadius: '16px', cursor: 'pointer' }}>
-                          <div style={{ fontSize: '12px', color: colors.textSub, marginBottom: '4px', fontWeight: 600 }}>{new Date(day.diary_date).getDate()}일</div>
-                          <div style={{ fontSize: '24px', marginBottom: '4px' }}>{day.is_locked ? '🔒' : day.ai_emoji}</div>
-                          <div style={{ fontSize: '12px', fontWeight: 700, color: colors.primary }}>{day.ai_score}점</div>
-                        </div>
-                      ))}
-                    </div>
+                  {renderMonthNav()}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: '6px', marginBottom: '6px' }}>
+                    {WEEKDAYS.map((w, i) => (
+                      <div key={w} style={{ textAlign: 'center', fontSize: '12px', fontWeight: 700, color: i === 0 ? colors.danger : colors.textSub }}>{w}</div>
+                    ))}
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: '6px', opacity: calendarLoading ? 0.4 : 1, transition: 'opacity 0.2s' }}>
+                    {calendarCells.map((cell, idx) => {
+                      if (cell === null) return <div key={`empty-${idx}`} />;
+                      const first = cell.entries[0];
+                      const hasEntry = cell.entries.length > 0;
+                      return (
+                        <button
+                          key={cell.key}
+                          type="button"
+                          onClick={() => handleDayClick(cell.entries)}
+                          disabled={!hasEntry}
+                          style={{ minHeight: '64px', border: cell.key === todayKey ? `2px solid ${colors.primary}` : '2px solid transparent', background: hasEntry ? colors.inputBg : 'transparent', borderRadius: '12px', padding: '6px 0', cursor: hasEntry ? 'pointer' : 'default', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px', color: colors.textMain }}
+                        >
+                          <span style={{ fontSize: '11px', fontWeight: 600, color: idx % 7 === 0 ? colors.danger : colors.textSub }}>{cell.day}</span>
+                          {hasEntry && (
+                            <>
+                              <span style={{ fontSize: '20px', lineHeight: 1.1 }}>{first.is_locked ? '🔒' : first.ai_emoji}</span>
+                              <span style={{ fontSize: '10px', fontWeight: 700, color: colors.primary }}>
+                                {first.is_locked ? '' : `${first.ai_score}점`}{cell.entries.length > 1 ? ` +${cell.entries.length - 1}` : ''}
+                              </span>
+                            </>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {!calendarLoading && monthData.length === 0 && (
+                    <p style={{ color: colors.textSub, textAlign: 'center', padding: '24px 0 0', margin: 0 }}>이 달에 작성된 일기가 없어요.</p>
                   )}
                 </div>
               )}
@@ -349,60 +633,92 @@ function App() {
               {/* 탭: 통계 */}
               {activeTab === 'insight' && (
                 <div>
-                  <h3 style={{ margin: '0 0 16px 4px', fontSize: '20px' }}>이번 달 나의 감정 통계</h3>
-                  {insightData && insightData.totalDiaries > 0 ? (
-                    <div style={{ ...cardStyle, textAlign: 'center', padding: '32px 24px' }}>
-                      <p style={{ fontSize: '16px', margin: '0 0 32px 0', color: colors.textSub }}>이번 달은 총 <strong style={{ color: colors.textMain }}>{insightData.totalDiaries}개</strong>의 기록이 모였어요.</p>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <div style={{ flex: 1 }}><div style={{ fontSize: '48px', marginBottom: '12px' }}>{insightData.topEmoji}</div><div style={{ fontWeight: 700, color: colors.textMain }}>주로 느낀 감정</div></div>
-                        <div style={{ width: '1px', height: '60px', backgroundColor: '#e5e8eb' }}></div>
-                        <div style={{ flex: 1 }}><div style={{ fontSize: '36px', fontWeight: 800, color: colors.primary, marginBottom: '12px' }}>{insightData.averageScore}<span style={{ fontSize: '20px' }}>점</span></div><div style={{ fontWeight: 700, color: colors.textMain }}>평균 AI 점수</div></div>
+                  <div style={{ ...cardStyle, padding: '16px 24px 0' }}>{renderMonthNav()}</div>
+                  {insightLoading ? (
+                    <div style={{ ...cardStyle, textAlign: 'center', padding: '60px 24px', color: colors.textSub }}>통계를 불러오는 중이에요...</div>
+                  ) : insightData && insightData.totalDiaries > 0 ? (
+                    <>
+                      <div style={{ ...cardStyle, textAlign: 'center', padding: '32px 24px' }}>
+                        <p style={{ fontSize: '16px', margin: '0 0 32px 0', color: colors.textSub }}>이 달에는 총 <strong style={{ color: colors.textMain }}>{insightData.totalDiaries}개</strong>의 기록이 모였어요.</p>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <div style={{ flex: 1 }}><div style={{ fontSize: '48px', marginBottom: '12px' }}>{insightData.topEmoji}</div><div style={{ fontWeight: 700 }}>주로 느낀 감정</div></div>
+                          <div style={{ width: '1px', height: '60px', backgroundColor: colors.border }}></div>
+                          <div style={{ flex: 1 }}><div style={{ fontSize: '36px', fontWeight: 800, color: colors.primary, marginBottom: '12px' }}>{insightData.averageScore}<span style={{ fontSize: '20px' }}>점</span></div><div style={{ fontWeight: 700 }}>평균 AI 점수</div></div>
+                        </div>
+                        <p style={{ margin: '24px 0 0', fontSize: '14px', color: colors.textSub }}>
+                          내가 매긴 평균 점수는 <strong style={{ color: colors.textMain }}>{insightData.averageUserScore}점</strong>
+                          {insightData.averageUserScore < insightData.averageScore ? '이에요. 생각보다 괜찮은 한 달을 보내고 있어요!' : insightData.averageUserScore > insightData.averageScore ? '이에요. 스스로에게 후한 편이네요 😊' : '으로 AI와 같아요.'}
+                        </p>
                       </div>
-                    </div>
+                      {insightData.emojiCounts && insightData.emojiCounts.length > 0 && (
+                        <div style={cardStyle}>
+                          <h4 style={{ margin: '0 0 16px 0' }}>감정 분포</h4>
+                          <div style={{ display: 'grid', gap: '10px' }}>
+                            {insightData.emojiCounts.map(item => (
+                              <div key={item.emoji} style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                                <span style={{ fontSize: '22px', width: '28px', textAlign: 'center' }}>{item.emoji}</span>
+                                <div style={{ flex: 1, height: '10px', backgroundColor: colors.inputBg, borderRadius: '5px', overflow: 'hidden' }}>
+                                  <div style={{ width: `${Math.round((item.count / maxEmojiCount) * 100)}%`, height: '100%', backgroundColor: colors.primary, borderRadius: '5px' }} />
+                                </div>
+                                <span style={{ fontSize: '13px', fontWeight: 700, color: colors.textSub, width: '32px', textAlign: 'right' }}>{item.count}회</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </>
                   ) : (
-                    <div style={{ ...cardStyle, textAlign: 'center', padding: '60px 24px', color: colors.textSub }}>아직 작성된 일기가 없어요.</div>
+                    <div style={{ ...cardStyle, textAlign: 'center', padding: '60px 24px', color: colors.textSub }}>이 달에 작성된 일기가 없어요.</div>
                   )}
                 </div>
               )}
 
-              {/* 탭: 설정 (신규) */}
+              {/* 탭: 설정 */}
               {activeTab === 'settings' && (
                 <div>
-                  <h3 style={{ margin: '0 0 16px 4px', fontSize: '20px' }}>보안 설정 ⚙️</h3>
+                  <h3 style={{ margin: '0 0 16px 4px', fontSize: '20px' }}>화면 설정 🎨</h3>
+                  <div style={cardStyle}>
+                    <label style={{ display: 'block', marginBottom: '12px', fontWeight: 600 }}>테마</label>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      {([['system', '시스템'], ['light', '라이트'], ['dark', '다크']] as [ThemeMode, string][]).map(([mode, label]) => (
+                        <button key={mode} type="button" onClick={() => setTheme(mode)} style={{ flex: 1, padding: '12px', borderRadius: '12px', border: `1px solid ${theme === mode ? colors.primary : colors.border}`, background: theme === mode ? colors.primarySoft : colors.inputBg, color: theme === mode ? colors.primary : colors.textMain, fontWeight: 700, cursor: 'pointer', fontSize: '14px' }}>{label}</button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <h3 style={{ margin: '24px 0 16px 4px', fontSize: '20px' }}>보안 설정 ⚙️</h3>
                   <div style={cardStyle}>
                     <div style={{ marginBottom: '20px' }}>
                       <label style={{ display: 'block', marginBottom: '8px', fontWeight: 600 }}>2차 비밀번호 설정</label>
-                      <input type="password" placeholder="사용할 2차 비밀번호를 입력하세요" value={settings.secondary_password || ''} onChange={(e) => setSettings({ ...settings, secondary_password: e.target.value })} style={{ width: '100%', padding: '16px', borderRadius: '12px', border: '1px solid #e5e8eb', backgroundColor: colors.inputBg, fontSize: '16px', color: '#191f28' }} />
+                      <input type="password" autoComplete="new-password" placeholder="사용할 2차 비밀번호를 입력하세요" value={settings.secondary_password || ''} onChange={e => setSettings({ ...settings, secondary_password: e.target.value })} style={inputStyle} />
                     </div>
                     <div style={{ marginBottom: '16px' }}>
                       <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', fontWeight: 600 }}>
-                        <input type="checkbox" checked={settings.require_on_login || false} onChange={(e) => setSettings({ ...settings, require_on_login: e.target.checked })} style={{ width: '20px', height: '20px', marginRight: '12px', accentColor: colors.primary }} />
+                        <input type="checkbox" checked={settings.require_on_login || false} onChange={e => setSettings({ ...settings, require_on_login: e.target.checked })} style={{ width: '20px', height: '20px', marginRight: '12px', accentColor: 'var(--primary)' }} />
                         앱 켤 때마다 2차 비밀번호 요구
                       </label>
                     </div>
                     <div style={{ marginBottom: '24px' }}>
                       <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', fontWeight: 600 }}>
-                        <input type="checkbox" checked={settings.require_on_diary || false} onChange={(e) => setSettings({ ...settings, require_on_diary: e.target.checked })} style={{ width: '20px', height: '20px', marginRight: '12px', accentColor: colors.primary }} />
+                        <input type="checkbox" checked={settings.require_on_diary || false} onChange={e => setSettings({ ...settings, require_on_diary: e.target.checked })} style={{ width: '20px', height: '20px', marginRight: '12px', accentColor: 'var(--primary)' }} />
                         비밀 일기(🔒) 열 때 2차 비밀번호 요구
                       </label>
                     </div>
-                    <button onClick={handleSaveSettings} style={{ width: '100%', padding: '16px', background: colors.primary, color: 'white', border: 'none', borderRadius: '12px', fontSize: '16px', fontWeight: 700, cursor: 'pointer' }}>
-                      설정 저장하기
-                    </button>
+                    <button type="button" onClick={handleSaveSettings} style={primaryBtn}>설정 저장하기</button>
                   </div>
                 </div>
               )}
             </div>
 
             {/* 하단 탭 네비게이션 */}
-            <div style={{ position: 'fixed', bottom: 0, left: '50%', transform: 'translateX(-50%)', width: '100%', maxWidth: '480px', backgroundColor: 'rgba(255, 255, 255, 0.9)', backdropFilter: 'blur(10px)', borderTop: '1px solid #f2f4f6', display: 'flex', justifyContent: 'space-around', padding: '12px 0 24px 0', zIndex: 100 }}>
-              {[
+            <div style={{ position: 'fixed', bottom: 0, left: '50%', transform: 'translateX(-50%)', width: '100%', maxWidth: '480px', backgroundColor: 'var(--nav-bg)', backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)', borderTop: `1px solid ${colors.border}`, display: 'flex', justifyContent: 'space-around', padding: '12px 0 calc(12px + env(safe-area-inset-bottom, 12px)) 0', zIndex: 100 }}>
+              {([
                 { id: 'write', icon: '✍️', label: '작성' },
                 { id: 'calendar', icon: '📅', label: '달력' },
                 { id: 'insight', icon: '📊', label: '통계' },
-                { id: 'settings', icon: '⚙️', label: '설정' }
-              ].map(tab => (
-                <button key={tab.id} onClick={() => setActiveTab(tab.id as any)} style={{ background: 'none', border: 'none', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px', width: '60px' }}>
+                { id: 'settings', icon: '⚙️', label: '설정' },
+              ] as { id: Tab; icon: string; label: string }[]).map(tab => (
+                <button key={tab.id} type="button" onClick={() => setActiveTab(tab.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px', width: '60px' }}>
                   <span style={{ fontSize: '20px', filter: activeTab === tab.id ? 'none' : 'grayscale(100%) opacity(0.5)' }}>{tab.icon}</span>
                   <span style={{ fontSize: '11px', fontWeight: activeTab === tab.id ? 700 : 500, color: activeTab === tab.id ? colors.textMain : colors.textSub }}>{tab.label}</span>
                 </button>
