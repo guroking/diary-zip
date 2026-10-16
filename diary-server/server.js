@@ -1,14 +1,21 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const { rateLimit } = require('express-rate-limit');
 const crypto = require('crypto');
-const pool = require('./config/db');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
+const pool = require('./config/db');
 
 const app = express();
+app.set('trust proxy', 1); // Render 프록시 뒤에서 실제 IP 기준으로 요청 제한
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors());
 app.use(express.json({ limit: '200kb' }));
 
 const MAX_CONTENT_LENGTH = 5000;
+const BCRYPT_ROUNDS = 10;
 
 // --- 🔒 암호화 유틸리티 ---
 // ⚠️ ENCRYPTION_KEY가 없으면 재시작마다 키가 바뀌어 기존 일기를 복호화할 수 없습니다. Render 환경변수에 고정값 필수.
@@ -17,6 +24,15 @@ if (!process.env.ENCRYPTION_KEY) {
 }
 const SECRET_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
 const IV_LENGTH = 16;
+
+// --- 🔑 JWT 설정 ---
+// JWT_SECRET을 따로 지정하는 것을 권장합니다. 없으면 ENCRYPTION_KEY에서 파생한 키를 사용합니다.
+if (!process.env.JWT_SECRET) {
+    console.warn('⚠️ JWT_SECRET 미설정: ENCRYPTION_KEY에서 파생한 키를 사용합니다. Render 환경변수에 JWT_SECRET 설정을 권장합니다.');
+}
+const JWT_SECRET = process.env.JWT_SECRET || crypto.createHash('sha256').update('diary-zip-jwt:' + SECRET_KEY).digest('hex');
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '30d';
+const UNLOCK_EXPIRES_IN = '10m';
 
 function encrypt(text) {
     if (!text) return text;
@@ -41,27 +57,42 @@ function decrypt(text) {
     }
 }
 
+// --- 🔐 비밀번호 해시 유틸 ---
+const isBcryptHash = (value) => typeof value === 'string' && /^\$2[aby]\$\d{2}\$/.test(value);
+
+// 해시와 비교. 아직 평문으로 남아 있는 기존 데이터도 비교는 허용하고 legacy=true로 알려 재해시하게 함
+async function verifyPassword(input, stored) {
+    if (!stored || typeof input !== 'string' || !input) return { ok: false, legacy: false };
+    if (isBcryptHash(stored)) return { ok: await bcrypt.compare(input, stored), legacy: false };
+    const a = Buffer.from(input);
+    const b = Buffer.from(String(stored));
+    const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+    return { ok, legacy: ok };
+}
+
+const hashPassword = (plain) => bcrypt.hash(plain, BCRYPT_ROUNDS);
+
 // --- 🚨 브루트포스(연속 실패) 방어 메모리 캐시 ---
 const failedAttempts = {};
 
-function checkBruteForce(userId) {
-    const record = failedAttempts[userId];
+function checkBruteForce(key) {
+    const record = failedAttempts[key];
     if (!record) return { isLocked: false };
     if (record.lockUntil && Date.now() < record.lockUntil) {
         return { isLocked: true, remainingSec: Math.ceil((record.lockUntil - Date.now()) / 1000) };
     }
-    if (record.lockUntil && Date.now() >= record.lockUntil) delete failedAttempts[userId];
+    if (record.lockUntil && Date.now() >= record.lockUntil) delete failedAttempts[key];
     return { isLocked: false };
 }
 
-function recordFailedAttempt(userId) {
-    if (!failedAttempts[userId]) failedAttempts[userId] = { count: 1 };
-    else failedAttempts[userId].count += 1;
-    if (failedAttempts[userId].count >= 5) failedAttempts[userId].lockUntil = Date.now() + 3 * 60 * 1000;
+function recordFailedAttempt(key) {
+    if (!failedAttempts[key]) failedAttempts[key] = { count: 1 };
+    else failedAttempts[key].count += 1;
+    if (failedAttempts[key].count >= 5) failedAttempts[key].lockUntil = Date.now() + 3 * 60 * 1000;
 }
 
-function clearFailedAttempt(userId) {
-    delete failedAttempts[userId];
+function clearFailedAttempt(key) {
+    delete failedAttempts[key];
 }
 
 // 1. DB 테이블 점검
@@ -95,26 +126,99 @@ async function initDB() {
                 diary_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        // AI 분석 결과(JSON)를 암호화해 저장 (기존 데이터는 NULL)
         await pool.query('ALTER TABLE diaries ADD COLUMN IF NOT EXISTS ai_result TEXT;');
-        // 달력/통계 조회 최적화 인덱스
         await pool.query('CREATE INDEX IF NOT EXISTS idx_diaries_user_date ON diaries (user_id, diary_date);');
         console.log('✅ diary 전용 테이블 점검 완료 (공유 DB의 다른 테이블은 건드리지 않음)');
+        await migratePlaintextPasswords();
     } catch (err) {
         console.error('❌ 테이블 점검 실패:', err);
     }
 }
+
+// 기존 평문 비밀번호(로그인/2차)를 bcrypt 해시로 1회 변환. diary의 users 테이블만 대상
+async function migratePlaintextPasswords() {
+    try {
+        const { rows } = await pool.query(
+            `SELECT id, password, secondary_password FROM users
+             WHERE password NOT LIKE '$2_$%'
+                OR (secondary_password IS NOT NULL AND secondary_password NOT LIKE '$2_$%')`
+        );
+        for (const u of rows) {
+            const pw = isBcryptHash(u.password) ? u.password : await hashPassword(String(u.password));
+            const sp = !u.secondary_password
+                ? null
+                : isBcryptHash(u.secondary_password) ? u.secondary_password : await hashPassword(String(u.secondary_password));
+            await pool.query('UPDATE users SET password = $1, secondary_password = $2 WHERE id = $3', [pw, sp, u.id]);
+        }
+        if (rows.length > 0) console.log(`🔐 평문 비밀번호 ${rows.length}건을 해시로 변환했습니다.`);
+    } catch (err) {
+        console.error('⚠️ 비밀번호 해시 마이그레이션 실패 (로그인 시 개별 변환됨):', err.message);
+    }
+}
 initDB();
 
-// 토큰 = 사용자 id (기존 방식 유지, 숫자 검증만 추가)
+// --- 🎫 토큰 ---
+const signSessionToken = (userId) => jwt.sign({ sub: String(userId), typ: 'session' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: JWT_EXPIRES_IN });
+const signUnlockToken = (userId) => jwt.sign({ sub: String(userId), typ: 'unlock' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: UNLOCK_EXPIRES_IN });
+
+function verifyToken(token, typ) {
+    try {
+        const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+        if (!payload || payload.typ !== typ) return null;
+        const userId = Number.parseInt(payload.sub, 10);
+        return Number.isInteger(userId) && userId > 0 ? userId : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// 서명 검증된 JWT만 허용 (이전 방식의 숫자 토큰은 거부되어 재로그인 필요)
 const authenticate = (req, res, next) => {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    const userId = Number.parseInt(token, 10);
-    if (!Number.isInteger(userId) || userId <= 0) return res.status(401).json({ error: '인증이 필요합니다.' });
+    const userId = token ? verifyToken(token, 'session') : null;
+    if (!userId) return res.status(401).json({ error: '로그인이 만료되었어요. 다시 로그인해주세요.', code: 'AUTH_REQUIRED' });
     req.userId = userId;
     next();
 };
+
+const hasValidUnlock = (req) => {
+    const token = req.headers['x-unlock-token'];
+    return typeof token === 'string' && verifyToken(token, 'unlock') === req.userId;
+};
+
+// 클라이언트에는 2차 비밀번호 값(해시 포함)을 절대 내려주지 않음
+function publicSettings(user) {
+    const has = Boolean(user && user.secondary_password);
+    return {
+        has_secondary_password: has,
+        require_on_login: has && Boolean(user.require_on_login),
+        require_on_diary: has && Boolean(user.require_on_diary)
+    };
+}
+
+// 2차 비밀번호 검증 (연속 5회 실패 시 3분 차단)
+async function checkSecondaryPassword(userId, stored, input) {
+    const key = `unlock:${userId}`;
+    const lock = checkBruteForce(key);
+    if (lock.isLocked) return { ok: false, httpStatus: 429, error: `비밀번호 입력 시도가 너무 많아 일시 차단되었습니다. (${lock.remainingSec}초 남음)` };
+    const result = await verifyPassword(input, stored);
+    if (result.ok) {
+        clearFailedAttempt(key);
+        if (result.legacy) await pool.query('UPDATE users SET secondary_password = $1 WHERE id = $2', [await hashPassword(input), userId]);
+        return { ok: true };
+    }
+    recordFailedAttempt(key);
+    const count = failedAttempts[key] ? failedAttempts[key].count : 1;
+    return { ok: false, httpStatus: 403, error: `2차 비밀번호가 일치하지 않습니다. (실패: ${count}/5회, 남은 기회: ${Math.max(0, 5 - count)}회)` };
+}
+
+// 인증 API 요청 제한 (IP 기준 15분 50회)
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 50,
+    message: { error: '요청이 너무 많아요. 잠시 후 다시 시도해주세요.' }
+});
 
 // --- 공통 유틸 ---
 function clampScore(value, fallback) {
@@ -290,72 +394,117 @@ function parseStoredAiResult(value) {
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 // === [API 1] 인증 ===
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authLimiter, async (req, res) => {
     try {
         const { login_id, password } = req.body || {};
-        if (!login_id || !password) return res.status(400).json({ error: '아이디와 비밀번호를 입력해주세요.' });
-        await pool.query('INSERT INTO users (login_id, password) VALUES ($1, $2)', [login_id, password]);
+        const id = typeof login_id === 'string' ? login_id.trim() : '';
+        if (id.length < 3 || id.length > 50) return res.status(400).json({ error: '아이디는 3~50자로 입력해주세요.' });
+        if (typeof password !== 'string' || password.length < 4 || password.length > 72) {
+            return res.status(400).json({ error: '비밀번호는 4~72자로 입력해주세요.' });
+        }
+        await pool.query('INSERT INTO users (login_id, password) VALUES ($1, $2)', [id, await hashPassword(password)]);
         res.status(201).json({ message: '가입 성공' });
     } catch (err) {
-        res.status(400).json({ error: '이미 존재하는 아이디입니다.' });
+        if (err && err.code === '23505') return res.status(400).json({ error: '이미 존재하는 아이디입니다.' });
+        console.error('회원가입 실패:', err);
+        res.status(500).json({ error: '회원가입 중 오류가 발생했습니다.' });
     }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
     try {
         const { login_id, password } = req.body || {};
-        const result = await pool.query('SELECT * FROM users WHERE login_id = $1 AND password = $2', [login_id, password]);
-        if (result.rows.length === 0) return res.status(401).json({ error: '아이디나 비밀번호가 틀립니다.' });
-        const user = result.rows[0];
-        const lockStatus = checkBruteForce(user.id);
+        const id = typeof login_id === 'string' ? login_id.trim() : '';
+        if (!id || typeof password !== 'string' || !password) return res.status(400).json({ error: '아이디와 비밀번호를 입력해주세요.' });
+
+        // 아이디 기준 연속 실패 차단 (5회 실패 시 3분)
+        const key = `login:${id.toLowerCase()}`;
+        const lockStatus = checkBruteForce(key);
         if (lockStatus.isLocked) {
-            return res.status(429).json({ error: `보안상 이유로 계정이 잠겼습니다. ${lockStatus.remainingSec}초 후에 다시 시도해주세요.` });
+            return res.status(429).json({ error: `로그인 실패가 많아 잠시 차단되었습니다. ${lockStatus.remainingSec}초 후에 다시 시도해주세요.` });
         }
-        res.json({
-            token: user.id.toString(),
-            settings: {
-                secondary_password: user.secondary_password,
-                require_on_login: user.require_on_login,
-                require_on_diary: user.require_on_diary
-            }
-        });
+
+        const result = await pool.query('SELECT * FROM users WHERE login_id = $1', [id]);
+        const user = result.rows[0];
+        const check = user ? await verifyPassword(password, user.password) : { ok: false };
+        if (!check.ok) {
+            recordFailedAttempt(key);
+            return res.status(401).json({ error: '아이디나 비밀번호가 틀립니다.' });
+        }
+        clearFailedAttempt(key);
+
+        // 아직 평문인 경우 이 기회에 해시로 교체
+        if (check.legacy) await pool.query('UPDATE users SET password = $1 WHERE id = $2', [await hashPassword(password), user.id]);
+        if (user.secondary_password && !isBcryptHash(user.secondary_password)) {
+            await pool.query('UPDATE users SET secondary_password = $1 WHERE id = $2', [await hashPassword(String(user.secondary_password)), user.id]);
+        }
+
+        res.json({ token: signSessionToken(user.id), settings: publicSettings(user) });
     } catch (err) {
+        console.error('로그인 실패:', err);
         res.status(500).json({ error: '서버 에러' });
     }
 });
 
 // === [API 2] 2차 보안 설정 및 검증 ===
+app.get('/api/settings', authenticate, async (req, res) => {
+    try {
+        const { rows } = await pool.query('SELECT secondary_password, require_on_login, require_on_diary FROM users WHERE id = $1', [req.userId]);
+        if (rows.length === 0) return res.status(401).json({ error: '계정을 찾을 수 없습니다.', code: 'AUTH_REQUIRED' });
+        res.json({ settings: publicSettings(rows[0]) });
+    } catch (err) {
+        res.status(500).json({ error: '설정 조회 에러' });
+    }
+});
+
 app.post('/api/settings', authenticate, async (req, res) => {
     try {
-        const { secondary_password, require_on_login, require_on_diary } = req.body || {};
-        await pool.query(
-            'UPDATE users SET secondary_password = $1, require_on_login = $2, require_on_diary = $3 WHERE id = $4',
-            [secondary_password || null, Boolean(require_on_login), Boolean(require_on_diary), req.userId]
+        const body = req.body || {};
+        const { rows } = await pool.query('SELECT secondary_password FROM users WHERE id = $1', [req.userId]);
+        if (rows.length === 0) return res.status(401).json({ error: '계정을 찾을 수 없습니다.', code: 'AUTH_REQUIRED' });
+        const current = rows[0].secondary_password;
+
+        // 이미 2차 비밀번호가 있으면 설정 변경 시 현재 비밀번호 확인 필수
+        if (current) {
+            const check = await checkSecondaryPassword(req.userId, current, body.current_secondary_password);
+            if (!check.ok) return res.status(check.httpStatus).json({ error: check.error });
+        }
+
+        let nextHash = current || null;
+        if (body.remove_secondary_password === true) {
+            nextHash = null;
+        } else if (typeof body.new_secondary_password === 'string' && body.new_secondary_password.length > 0) {
+            const pw = body.new_secondary_password;
+            if (pw.length < 4 || pw.length > 72) return res.status(400).json({ error: '2차 비밀번호는 4~72자로 설정해주세요.' });
+            nextHash = await hashPassword(pw);
+        } else if (current && !isBcryptHash(current)) {
+            nextHash = await hashPassword(String(current));
+        }
+
+        const has = Boolean(nextHash);
+        const updated = await pool.query(
+            `UPDATE users SET secondary_password = $1, require_on_login = $2, require_on_diary = $3 WHERE id = $4
+             RETURNING secondary_password, require_on_login, require_on_diary`,
+            [nextHash, has && Boolean(body.require_on_login), has && Boolean(body.require_on_diary), req.userId]
         );
-        res.json({ message: '설정이 성공적으로 저장되었습니다.' });
+        res.json({ message: '설정이 성공적으로 저장되었습니다.', settings: publicSettings(updated.rows[0]) });
     } catch (err) {
+        console.error('설정 저장 에러:', err);
         res.status(500).json({ error: '설정 저장 에러' });
     }
 });
 
+// 2차 비밀번호 확인 → 10분짜리 잠금 해제 토큰 발급
 app.post('/api/auth/verify-lock', authenticate, async (req, res) => {
-    const lockStatus = checkBruteForce(req.userId);
-    if (lockStatus.isLocked) {
-        return res.status(429).json({ error: `비밀번호 입력 시도가 너무 많아 일시 차단되었습니다. (${lockStatus.remainingSec}초 남음)` });
-    }
     try {
         const { secondary_password } = req.body || {};
         const result = await pool.query('SELECT secondary_password FROM users WHERE id = $1', [req.userId]);
-        if (result.rows.length === 0) return res.status(404).json({ error: '유저를 찾을 수 없습니다.' });
-        const dbPassword = result.rows[0].secondary_password;
-        if (dbPassword && dbPassword === secondary_password) {
-            clearFailedAttempt(req.userId);
-            return res.json({ success: true, message: '잠금 해제 성공' });
-        }
-        recordFailedAttempt(req.userId);
-        const currentRecord = failedAttempts[req.userId] || { count: 1 };
-        const remainingTries = Math.max(0, 5 - currentRecord.count);
-        return res.status(401).json({ error: `비밀번호가 일치하지 않습니다. (실패: ${currentRecord.count}/5회, 남은 기회: ${remainingTries}회)` });
+        if (result.rows.length === 0) return res.status(401).json({ error: '계정을 찾을 수 없습니다.', code: 'AUTH_REQUIRED' });
+        const stored = result.rows[0].secondary_password;
+        if (!stored) return res.json({ success: true, unlock_token: signUnlockToken(req.userId) });
+        const check = await checkSecondaryPassword(req.userId, stored, secondary_password);
+        if (!check.ok) return res.status(check.httpStatus).json({ error: check.error });
+        res.json({ success: true, message: '잠금 해제 성공', unlock_token: signUnlockToken(req.userId) });
     } catch (err) {
         res.status(500).json({ error: '검증 서버 에러' });
     }
@@ -373,7 +522,6 @@ app.post('/api/diaries', authenticate, async (req, res) => {
 
         const aiResult = await analyzeDiary(text, emoji, score);
 
-        // diary_date는 한국 시간 기준으로 저장 (자정 전후 날짜 밀림 방지)
         const insert = await pool.query(
             `INSERT INTO diaries (user_id, content, user_emoji, user_score, is_locked, ai_emoji, ai_score, ai_result, diary_date)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, (NOW() AT TIME ZONE 'Asia/Seoul'))
@@ -387,19 +535,33 @@ app.post('/api/diaries', authenticate, async (req, res) => {
     }
 });
 
+// 비밀 일기 + '비밀 일기 열 때 2차 비밀번호 요구' 설정이면 잠금 해제 토큰 필요 (서버에서 강제)
+async function loadOwnedDiary(req, diaryId) {
+    const { rows } = await pool.query(
+        `SELECT d.id, to_char(d.diary_date, 'YYYY-MM-DD') AS date_key, to_char(d.diary_date, 'HH24:MI') AS time_label,
+                d.content, d.user_emoji, d.user_score, d.is_locked, d.ai_emoji, d.ai_score, d.ai_result,
+                u.require_on_diary, (u.secondary_password IS NOT NULL AND u.secondary_password <> '') AS has_sp
+         FROM diaries d JOIN users u ON u.id = d.user_id
+         WHERE d.id = $1 AND d.user_id = $2`,
+        [diaryId, req.userId]
+    );
+    if (rows.length === 0) return { status: 404 };
+    const row = rows[0];
+    if (row.is_locked && row.require_on_diary && row.has_sp && !hasValidUnlock(req)) return { status: 403 };
+    return { status: 200, row };
+}
+
+const UNLOCK_REQUIRED_BODY = { error: '비밀 일기를 보려면 2차 비밀번호 확인이 필요해요.', code: 'UNLOCK_REQUIRED' };
+
 // === [API 4] 일기 상세 ===
 app.get('/api/diaries/:id', authenticate, async (req, res) => {
     try {
         const diaryId = Number.parseInt(req.params.id, 10);
         if (!Number.isInteger(diaryId)) return res.status(400).json({ error: '잘못된 일기 번호입니다.' });
-        const { rows } = await pool.query(
-            `SELECT id, to_char(diary_date, 'YYYY-MM-DD') AS date_key, to_char(diary_date, 'HH24:MI') AS time_label,
-                    content, user_emoji, user_score, is_locked, ai_emoji, ai_score, ai_result
-             FROM diaries WHERE id = $1 AND user_id = $2`,
-            [diaryId, req.userId]
-        );
-        if (rows.length === 0) return res.status(404).json({ error: '일기를 찾을 수 없습니다.' });
-        const row = rows[0];
+        const found = await loadOwnedDiary(req, diaryId);
+        if (found.status === 404) return res.status(404).json({ error: '일기를 찾을 수 없습니다.' });
+        if (found.status === 403) return res.status(403).json(UNLOCK_REQUIRED_BODY);
+        const { require_on_diary, has_sp, ...row } = found.row;
         res.json({ data: { ...row, content: decrypt(row.content), ai_result: parseStoredAiResult(row.ai_result) } });
     } catch (err) {
         console.error('일기 상세 조회 실패:', err);
@@ -412,8 +574,10 @@ app.delete('/api/diaries/:id', authenticate, async (req, res) => {
     try {
         const diaryId = Number.parseInt(req.params.id, 10);
         if (!Number.isInteger(diaryId)) return res.status(400).json({ error: '잘못된 일기 번호입니다.' });
-        const result = await pool.query('DELETE FROM diaries WHERE id = $1 AND user_id = $2', [diaryId, req.userId]);
-        if (result.rowCount === 0) return res.status(404).json({ error: '일기를 찾을 수 없습니다.' });
+        const found = await loadOwnedDiary(req, diaryId);
+        if (found.status === 404) return res.status(404).json({ error: '일기를 찾을 수 없습니다.' });
+        if (found.status === 403) return res.status(403).json(UNLOCK_REQUIRED_BODY);
+        await pool.query('DELETE FROM diaries WHERE id = $1 AND user_id = $2', [diaryId, req.userId]);
         res.json({ message: '삭제되었습니다.' });
     } catch (err) {
         res.status(500).json({ error: '일기 삭제 에러' });
