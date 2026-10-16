@@ -1,15 +1,26 @@
 <!doctype html>
-<html lang="en">
+<html lang="ko">
 
 <head>
-  <link rel="manifest" href="/manifest.json" />
-  <meta name="theme-color" content="#3182f6" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#f2f4f6" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#101318" media="(prefers-color-scheme: dark)" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-  <meta charset="UTF-8" />
+  <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>diary</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" />
+  <title>Diary.zip</title>
+  <script>
+    // 저장된 테마를 첫 페인트 전에 적용해 깜빡임 방지
+    try {
+      var t = localStorage.getItem('theme');
+      if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  </script>
 </head>
 
 <body>
