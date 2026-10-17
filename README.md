@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white" alt="TypeScript" />
   <img src="https://img.shields.io/badge/Node.js-Express-339933?logo=node.js&logoColor=white" alt="Node.js and Express" />
   <img src="https://img.shields.io/badge/PostgreSQL-Database-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL" />
-  <img src="https://img.shields.io/badge/Gemini-AI-8E75B2?logo=google&logoColor=white" alt="Gemini AI" />
+  <img src="https://img.shields.io/badge/OpenAI-GPT-412991?logo=openai&logoColor=white" alt="OpenAI GPT" />
 </p>
 
 <p>무엇이든 편하게 적어 보세요.<br />Diary.zip이 하루의 핵심과 다음 행동을 정리해 드립니다.</p>
@@ -54,25 +54,28 @@ npm run dev
 
 # 새 터미널에서 백엔드 설치 및 실행
 cd ../diary-server
+cp .env.example .env   # 값 채우기
 npm install
 npm start
 ```
 
 ## ⚙️ 환경 변수
 
-`diary-server/.env` 또는 Render의 Environment에 다음 값을 설정하세요.
+`diary-server/.env` 또는 Render **백엔드 Web Service**의 Environment에 다음 값을 설정하세요. (예시는 `diary-server/.env.example`)
 
 ```env
 PORT=5000
 DATABASE_URL=postgresql://username:password@host:5432/database
-GEMINI_API_KEY=your_gemini_api_key
+OPENAI_API_KEY=sk-your-openai-api-key
+OPENAI_MODEL=gpt-4o-mini
 ENCRYPTION_KEY=your_long_random_encryption_key
 JWT_SECRET=your_long_random_jwt_secret
 ```
 
 ### 환경 변수 주의사항
 
-- `GEMINI_API_KEY`는 Google AI Studio에서 발급한 서버 전용 키를 사용합니다.
+- `OPENAI_API_KEY`는 OpenAI 대시보드에서 발급한 **서버 전용** 키입니다. 프론트엔드에 넣지 마세요.
+- `OPENAI_MODEL`은 선택 사항입니다. 비우면 `gpt-4o-mini` → `gpt-4.1-mini` 순서로 시도합니다.
 - `ENCRYPTION_KEY`는 저장된 일기를 복호화하는 데 사용되므로 **설정 후 변경하지 마세요**.
 - `JWT_SECRET` 변경 시 기존 로그인 토큰은 만료되어 다시 로그인해야 합니다.
 - `.env` 파일과 API 키는 절대 Git에 커밋하지 마세요.
@@ -86,6 +89,8 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
 위 명령을 각각 실행해 `ENCRYPTION_KEY`와 `JWT_SECRET`에 서로 다른 값을 넣으세요.
 
+Render 설정 절차는 [RENDER_SETUP.md](./RENDER_SETUP.md)를 참고하세요.
+
 ## 🧱 기술 스택
 
 | 영역 | 기술 |
@@ -94,7 +99,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 | Backend | Node.js, Express.js |
 | Database | PostgreSQL, `pg` connection pool |
 | Authentication | JWT, bcrypt |
-| AI | Google Gemini API |
+| AI | OpenAI API (Responses API + Structured Outputs, Chat Completions 폴백) |
 | Deployment | Render |
 
 ## 📁 프로젝트 구조
@@ -105,14 +110,16 @@ diary-zip/
 │   ├── src/
 │   │   ├── App.tsx
 │   │   ├── App.css
-│   │   └── index.css
+│   │   ├── index.css
 │   │   └── assets/
 │   └── package.json
 ├── diary-server/       # Express 백엔드
 │   ├── config/db.js     # PostgreSQL 연결 설정
-│   ├── server.js        # API 서버
-│   ├── package.json
-│   └── test.js
+│   ├── server.js        # API 서버 (인증·암호화·AI 분석)
+│   ├── test.js          # /health 점검 스크립트
+│   ├── .env.example
+│   └── package.json
+├── RENDER_SETUP.md      # Render 배포/환경변수 매뉴얼
 └── README.md
 ```
 
@@ -120,15 +127,17 @@ diary-zip/
 
 | Method | Endpoint | 설명 |
 | --- | --- | --- |
+| `GET` | `/health` | 서버 상태 및 AI 연결 진단 |
 | `POST` | `/api/auth/register` | 회원가입 |
 | `POST` | `/api/auth/login` | 로그인 및 JWT 발급 |
-| `GET` | `/api/auth/me` | 로그인 사용자 정보 확인 |
-| `POST` | `/api/auth/verify-pin` | 비공개 일기 2차 잠금 해제 |
-| `GET` | `/api/diaries` | 일기 목록 조회 |
+| `GET` | `/api/settings` | 2차 잠금 설정 조회 |
+| `POST` | `/api/settings` | 2차 잠금 설정 변경 |
+| `POST` | `/api/auth/verify-lock` | 2차 비밀번호 확인 → 10분 잠금 해제 토큰 발급 |
 | `POST` | `/api/diaries` | 일기 작성 및 AI 분석 |
-| `GET` | `/api/diaries/:id` | 일기 상세 조회 |
+| `GET` | `/api/diaries/:id` | 일기 상세 조회 (비밀 일기는 `X-Unlock-Token` 필요) |
 | `DELETE` | `/api/diaries/:id` | 일기 삭제 |
-| `GET` | `/api/calendar/monthly` | 월간 달력 및 통계 조회 |
+| `GET` | `/api/calendar/month?year=&month=` | 월간 달력 데이터 |
+| `GET` | `/api/calendar/insight?year=&month=` | 월간 통계 |
 
 인증이 필요한 API는 로그인 후 발급된 Bearer 토큰을 사용합니다.
 
@@ -138,11 +147,12 @@ Authorization: Bearer <access-token>
 
 ## 🔒 보안 및 데이터 보호
 
-- 로그인 비밀번호와 2차 PIN은 bcrypt 해시로 저장합니다.
+- 로그인 비밀번호와 2차 비밀번호는 bcrypt 해시로 저장합니다.
 - 인증은 서명된 JWT를 사용합니다.
 - 일기 본문과 AI 분석 결과는 서버에서 암호화하여 저장합니다.
 - 비공개 일기는 추가 잠금 해제 토큰을 요구합니다.
 - API 키와 암호화 키는 클라이언트 코드에 노출하지 않습니다.
+- 일기 본문은 AI 분석을 위해 OpenAI API로 전송됩니다. 분석 프롬프트는 본문 속 지시문을 따르지 않도록 구성되어 있습니다.
 
 > ⚠️ `ENCRYPTION_KEY`를 분실하거나 변경하면 기존 암호화 데이터를 복호화할 수 없습니다. 안전한 비밀번호 관리자에 별도로 백업하세요.
 
