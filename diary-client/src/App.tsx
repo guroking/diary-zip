@@ -36,6 +36,16 @@ const labelStyle: React.CSSProperties = { display: 'block', marginBottom: '8px',
 function AnalysisCard({ data }: { data: SummaryData }) {
   const lines = Array.isArray(data.three_line_summary) ? data.three_line_summary : [];
   const reminders = Array.isArray(data.reminders) ? data.reminders : [];
+  const [checkedReminders, setCheckedReminders] = useState<boolean[]>(() => reminders.map(() => false));
+
+  useEffect(() => {
+    setCheckedReminders(reminders.map(() => false));
+  }, [data, reminders.length]);
+
+  const toggleReminder = (index: number) => {
+    setCheckedReminders((previous) => previous.map((checked, itemIndex) => itemIndex === index ? !checked : checked));
+  };
+
   return <div>
     <h3 style={{ margin: '0 0 8px', color: colors.primary }}>{data.title}</h3>
     <p style={{ margin: '0 0 20px', fontSize: '17px', fontWeight: 600 }}>{data.one_line_summary}</p>
@@ -47,7 +57,7 @@ function AnalysisCard({ data }: { data: SummaryData }) {
     {(data.gratitude || data.reflection || reminders.length > 0) && <div style={{ marginTop: '20px', display: 'grid', gap: '10px' }}>
       {data.gratitude && <div style={{ backgroundColor: colors.inputBg, borderRadius: '12px', padding: '12px 16px' }}><strong>🙏 감사한 일</strong><p style={{ margin: '4px 0 0', color: colors.textBody }}>{data.gratitude}</p></div>}
       {data.reflection && <div style={{ backgroundColor: colors.inputBg, borderRadius: '12px', padding: '12px 16px' }}><strong>🪞 돌아볼 점</strong><p style={{ margin: '4px 0 0', color: colors.textBody }}>{data.reflection}</p></div>}
-      {reminders.length > 0 && <div style={{ backgroundColor: colors.inputBg, borderRadius: '12px', padding: '12px 16px' }}><strong>⏰ 잊지 말 것</strong><ul style={{ margin: '4px 0 0', paddingLeft: '20px', color: colors.textBody, lineHeight: 1.6 }}>{reminders.map((reminder, index) => <li key={index}>{reminder}</li>)}</ul></div>}
+      {reminders.length > 0 && <div style={{ backgroundColor: colors.inputBg, borderRadius: '12px', padding: '12px 16px' }}><strong>✅ 오늘 할 일</strong><div style={{ marginTop: '8px', display: 'grid', gap: '8px' }}>{reminders.map((reminder, index) => <label key={`${reminder}-${index}`} style={{ display: 'flex', alignItems: 'flex-start', gap: '10px', cursor: 'pointer', color: checkedReminders[index] ? colors.textSub : colors.textBody, textDecoration: checkedReminders[index] ? 'line-through' : 'none', lineHeight: 1.5 }}><input type="checkbox" checked={Boolean(checkedReminders[index])} onChange={() => toggleReminder(index)} style={{ ...checkboxStyle, flex: '0 0 auto', marginTop: '2px' }} /> <span>{reminder}</span></label>)}</div><p style={{ margin: '10px 0 0', color: colors.textSub, fontSize: '12px' }}>체크 상태는 현재 화면에서만 유지돼요.</p></div>}
     </div>}
     {data.source === 'fallback' && <p style={{ margin: '16px 0 0', fontSize: '12px', color: colors.textSub }}>※ AI 분석 서버에 연결하지 못해 일기 내용을 바탕으로 간단히 요약했어요.</p>}
   </div>;
