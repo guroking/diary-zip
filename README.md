@@ -28,7 +28,8 @@ Diary.zip은 긴 일기를 부담 없이 기록하고, AI의 도움으로 하루
 
 - 📝 **자유로운 기록** — 정리되지 않은 생각도 편하게 저장
 - 🧠 **AI 1줄·3줄 요약** — 긴 일기에서 핵심만 빠르게 확인
-- 💛 **감사와 회고** — 감사한 일과 돌아볼 점을 구조화
+- 🎯 **객관적인 하루 점수** — AI의 시선으로 바라본 하루의 점수와 나의 점수 비교
+- 💛 **감사한 일과 돌아볼 점** — 일기 속 긍정적인 순간과 다시 생각해볼 부분 추출
 - ✅ **할 일 추출** — 일기 속 계획과 미완료 작업을 놓치지 않도록 정리
 - 🗓️ **달력과 통계** — 날짜별 기록과 월간 감정 흐름 확인
 - 🌙 **다크모드** — 모바일에서도 편안하게 기록
@@ -61,12 +62,12 @@ npm start
 
 ## ⚙️ 환경 변수
 
-`diary-server/.env` 또는 Render **백엔드 Web Service**의 Environment에 다음 값을 설정하세요. (예시는 `diary-server/.env.example`)
+`diary-server/.env` 또는 Render **백엔드 Web Service**의 Environment에 다음 값을 설정하세요. 예시는 `diary-server/.env.example`를 참고하세요.
 
 ```env
 PORT=5000
 DATABASE_URL=postgresql://username:password@host:5432/database
-OPENAI_API_KEY=sk-your-openai-api-key
+OPENAI_API_KEY=your_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
 ENCRYPTION_KEY=your_long_random_encryption_key
 JWT_SECRET=your_long_random_jwt_secret
@@ -74,8 +75,8 @@ JWT_SECRET=your_long_random_jwt_secret
 
 ### 환경 변수 주의사항
 
-- `OPENAI_API_KEY`는 OpenAI 대시보드에서 발급한 **서버 전용** 키입니다. 프론트엔드에 넣지 마세요.
-- `OPENAI_MODEL`은 선택 사항입니다. 비우면 `gpt-4o-mini` → `gpt-4.1-mini` 순서로 시도합니다.
+- `OPENAI_API_KEY`는 서버 전용 키입니다. 프론트엔드에 넣지 마세요.
+- `OPENAI_MODEL`은 사용할 OpenAI 모델입니다. 현재 기본 모델은 `gpt-4o-mini`입니다.
 - `ENCRYPTION_KEY`는 저장된 일기를 복호화하는 데 사용되므로 **설정 후 변경하지 마세요**.
 - `JWT_SECRET` 변경 시 기존 로그인 토큰은 만료되어 다시 로그인해야 합니다.
 - `.env` 파일과 API 키는 절대 Git에 커밋하지 마세요.
@@ -99,7 +100,7 @@ Render 설정 절차는 [RENDER_SETUP.md](./RENDER_SETUP.md)를 참고하세요.
 | Backend | Node.js, Express.js |
 | Database | PostgreSQL, `pg` connection pool |
 | Authentication | JWT, bcrypt |
-| AI | OpenAI API (Responses API + Structured Outputs, Chat Completions 폴백) |
+| AI | OpenAI API (GPT-4o-mini) |
 | Deployment | Render |
 
 ## 📁 프로젝트 구조
@@ -132,9 +133,9 @@ diary-zip/
 | `POST` | `/api/auth/login` | 로그인 및 JWT 발급 |
 | `GET` | `/api/settings` | 2차 잠금 설정 조회 |
 | `POST` | `/api/settings` | 2차 잠금 설정 변경 |
-| `POST` | `/api/auth/verify-lock` | 2차 비밀번호 확인 → 10분 잠금 해제 토큰 발급 |
+| `POST` | `/api/auth/verify-lock` | 2차 비밀번호 확인 및 잠금 해제 토큰 발급 |
 | `POST` | `/api/diaries` | 일기 작성 및 AI 분석 |
-| `GET` | `/api/diaries/:id` | 일기 상세 조회 (비밀 일기는 `X-Unlock-Token` 필요) |
+| `GET` | `/api/diaries/:id` | 일기 상세 조회 |
 | `DELETE` | `/api/diaries/:id` | 일기 삭제 |
 | `GET` | `/api/calendar/month?year=&month=` | 월간 달력 데이터 |
 | `GET` | `/api/calendar/insight?year=&month=` | 월간 통계 |
@@ -145,6 +146,36 @@ diary-zip/
 Authorization: Bearer <access-token>
 ```
 
+## 🤖 AI 분석 결과
+
+AI 분석 결과에는 다음 항목이 포함됩니다.
+
+```json
+{
+  "title": "오늘 하루를 요약하는 제목",
+  "one_line_summary": "하루의 핵심을 요약한 한 문장",
+  "three_line_summary": [
+    "오늘 있었던 주요 사건",
+    "일기에서 드러난 감정",
+    "하루를 돌아볼 만한 생각"
+  ],
+  "ai_emoji": "🙂",
+  "ai_score": 75,
+  "ai_comment": "일기 내용을 바탕으로 한 AI 코멘트",
+  "gratitude": "감사한 일",
+  "reflection": "돌아볼 점",
+  "reminders": ["내일 해야 할 일"]
+}
+```
+
+### 점수의 의미
+
+- **사용자 점수**: 사용자가 직접 느낀 하루의 점수입니다.
+- **AI 점수**: AI가 일기의 사건과 감정 표현을 바탕으로 분석한 객관적인 참고 점수입니다.
+- **월간 평균 AI 점수**: 해당 월에 기록한 일기들의 AI 점수 평균입니다.
+
+AI 점수는 사용자의 감정을 대신 판단하는 값이 아니라, 같은 하루를 다른 관점에서 돌아보기 위한 보조 지표입니다.
+
 ## 🔒 보안 및 데이터 보호
 
 - 로그인 비밀번호와 2차 비밀번호는 bcrypt 해시로 저장합니다.
@@ -152,9 +183,17 @@ Authorization: Bearer <access-token>
 - 일기 본문과 AI 분석 결과는 서버에서 암호화하여 저장합니다.
 - 비공개 일기는 추가 잠금 해제 토큰을 요구합니다.
 - API 키와 암호화 키는 클라이언트 코드에 노출하지 않습니다.
-- 일기 본문은 AI 분석을 위해 OpenAI API로 전송됩니다. 분석 프롬프트는 본문 속 지시문을 따르지 않도록 구성되어 있습니다.
+- 일기 본문은 AI 분석을 위해 OpenAI API로 전송됩니다.
 
 > ⚠️ `ENCRYPTION_KEY`를 분실하거나 변경하면 기존 암호화 데이터를 복호화할 수 없습니다. 안전한 비밀번호 관리자에 별도로 백업하세요.
+
+## 🗄️ 공유 데이터베이스 주의사항
+
+Diary.zip은 `billiards-record`와 데이터베이스를 공유할 수 있습니다. Diary.zip의 데이터베이스 초기화 과정에서는 Diary.zip 전용 테이블만 관리하며, 다음 당구 기록 테이블은 삭제하거나 변경하지 않습니다.
+
+- `universities`
+- `players`
+- `matches`
 
 ## 🗺️ 향후 개선 아이디어
 
