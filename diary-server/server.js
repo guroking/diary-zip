@@ -25,7 +25,7 @@ const BCRYPT_ROUNDS = 10;
 //  - OPENAI_TIMEOUT_MS : 선택. 기본 25초.
 // =====================================================================
 const AI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS) || 25000;
-const AI_MODELS = [...new Set([process.env.OPENAI_MODEL, 'gpt-4o-mini', 'gpt-4.1-mini'].map((m) => (m || '').trim()).filter(Boolean))];
+const AI_MODELS = [...new Set([process.env.OPENAI_MODEL, 'gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-3.5-turbo'].map((m) => (m || '').trim()).filter(Boolean))];
 const openai = process.env.OPENAI_API_KEY
     ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: AI_TIMEOUT_MS, maxRetries: 1 })
     : null;
@@ -241,7 +241,7 @@ const SYSTEM_PROMPT = `너는 'Diary.zip' 서비스의 다이어리 분석 전�
 
 [출력 필드]
 - title: 오늘 하루를 요약하는 제목 (15자 이내)
-- one_line_summary: 핵심 감정이나 사건을 요약한 한 문장
+- one_line_summary: 핵심 감정이나 사건을 요약하는 한 문장
 - three_line_summary: 일기에 실제로 등장한 사건/감정/생각을 각각 담은 서로 다른 3개의 문장 배열. 일반적인 덕담 금지. 일기가 짧으면 사건 / 감정 / 생각으로 나눠 요약
 - ai_emoji: 상황에 맞는 이모지 1개
 - ai_score: 1~100 사이 정수 (하루의 긍정도)
