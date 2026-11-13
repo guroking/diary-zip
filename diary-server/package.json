@@ -12,8 +12,9 @@
     "test": "node test.js"
   },
   "license": "ISC",
-  "description": "Diary.zip API 서버 (Express + PostgreSQL + OpenAI)",
+  "description": "Diary.zip API 서버 (Express + PostgreSQL + OpenAI + Gemini)",
   "dependencies": {
+    "@google/generative-ai": "^0.21.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^18.0.5",
